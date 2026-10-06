@@ -15,7 +15,7 @@ concurso-ia-streamlit/
     guide_schema.py            contrato do guia
     study.py                   plano, seleção, pontuação e deduplicação
   services/
-    database.py                Supabase Auth, RPCs e persistência
+    database.py                licenças por e-mail, RPCs e persistência
     ai.py                      Gemini texto/visão e verificação de questões
     extraction.py              extração textual do PDF
     guide_pdf.py               guia visual com cartões e tabelas
@@ -33,13 +33,14 @@ concurso-ia-streamlit/
   sql/
     001_schema.sql             tabelas, RLS, licença e cotas atômicas
     002_issue_license_example.sql
+    003_migrate_email_license.sql migração do banco anterior
   assets/                      fontes DejaVu e licença
   tests/                       testes sem chamadas externas
 ```
 
 ## Arquitetura
 
-Streamlit serve a interface e executa o backend Python. O navegador não recebe a chave Gemini ou service_role. Cada sessão Streamlit possui seu próprio cliente Supabase autenticado; ele não usa cache global. O Supabase Auth gerencia senhas e sessões. O Postgres valida licença e acesso por Row Level Security, usando o ID do aluno e da sessão JWT.
+Streamlit serve a interface e executa o backend Python. O navegador não recebe a chave Gemini ou service_role. O login pede somente E-mail e Chave de Licença. Não há chamada ao Supabase Auth nem criação de senha. Cada sessão Streamlit guarda seu cliente e um token opaco de licença, sem cache global. O banco valida e-mail, hash da chave, validade e reserva de sessão. As tabelas têm RLS e nenhum acesso direto é concedido às roles anon/authenticated; operações usam somente RPCs com validação do token e separação por proprietário.
 
 O edital processado alimenta o guia, disciplinas, recomendações de quantidade, plano, contexto da banca e rubrica de redação. Conteúdo gerado é persistido como JSON no Supabase e associado ao edital, evitando misturar históricos de concursos. Os documentos PDF são reconstruídos a partir desse conteúdo. Fotos e arquivos originais não são armazenados nesta base.
 
@@ -48,11 +49,13 @@ O edital processado alimenta o guia, disciplinas, recomendações de quantidade,
 - `licenses`: hash SHA-256 da chave aleatória, proprietário definido pelo administrador, habilitação, validade opcional, sessão ativa, prazo da reserva e cota diária.
 - `ai_usage`: contador diário UTC por aluno. A reserva da chamada é atômica no banco e não pode exceder o limite definido pelo administrador.
 - `records`: registros separados por usuário e tipo (edital, plano, apostila, banca, questão, simulado, tentativa e redação). JSON de até 4 MB por registro; consultas paginadas.
-- `auth.users`: contas gerenciadas pelo Supabase; senhas não são salvas nas tabelas do aplicativo.
+- O identificador do aluno é um UUID interno da licença. Não depende de auth.users. E-mail e chave são os únicos dados de entrada do login; a chave funciona como credencial secreta.
 
-A função `acquire_license` bloqueia a linha da licença antes de conceder acesso, impedindo duas autenticações de adquirir a mesma licença simultaneamente. A licença é vinculada previamente ao usuário; outra conta não pode reivindicá-la. `heartbeat_license` renova por dois minutos, a cada 30 segundos no app e antes das operações. `release_license` libera ao sair. Uma sessão abandonada fica disponível depois do prazo. A RLS exige licença válida e a sessão JWT correspondente mesmo para acessos diretos ao banco.
+A função `license_login` bloqueia a linha da licença antes de emitir um token aleatório de 256 bits. O banco guarda somente o hash desse token. O e-mail deve corresponder à licença emitida pelo administrador. A reserva é renovada por dois minutos a cada 30 segundos e antes das operações; outro login é bloqueado enquanto ela estiver ativa. O token tem prazo máximo de oito horas. Ao sair, o hash é invalidado; ao adquirir uma nova sessão após abandono, o token anterior perde autorização.
 
-Isso controla sessões de autenticação distintas, não constitui DRM inviolável. Reutilização do mesmo token roubado não é detectada como um dispositivo diferente. Um PDF já baixado não pode ser revogado. A validação SQL e testes reais de concorrência/isolamento são obrigatórios antes da venda.
+As RPCs de listagem e escrita recebem o token, resolvem o proprietário no servidor e não aceitam um user_id informado pelo cliente. A escrita não pode sobrescrever registros de outro aluno. A cota continua atômica e controlada pelo administrador. O helper de validação fica em schema privado sem permissão para clientes. Não é necessário service_role no aplicativo.
+
+A chave da licença passa a ser a credencial principal: mantenha-a privada. O fluxo não verifica posse da caixa de e-mail. Reutilização de um token roubado não é detectada como dispositivo diferente. Não é DRM inviolável e um PDF baixado não pode ser revogado. A mudança SQL não foi aplicada a um banco externo nesta entrega; testes reais de isolamento e concorrência continuam necessários.
 
 ## Configuração local
 
@@ -70,11 +73,13 @@ No Windows pode usar `py` no lugar de `python`. Sem Secrets, o aplicativo mostra
 
 ## Supabase
 
-1. Crie um projeto e execute `sql/001_schema.sql` uma vez no SQL Editor. O script cria as tabelas e funções; não é uma migração idempotente para rodar repetidamente.
-2. Em Authentication, crie o usuário com e-mail e senha. Configure a confirmação de e-mail conforme seu fluxo. Nesta base não há cadastro aberto, checkout ou recuperação de senha implementados.
-3. Em `002_issue_license_example.sql`, substitua **as duas ocorrências** do UUID de exemplo pelo ID do usuário criado. Execute no SQL Editor como administrador. A chave retornada deve ser entregue ao aluno de forma privada; o banco guarda apenas o hash.
-4. Copie URL e chave publishable/anon para Secrets. **Não use service_role.** O SQL revoga leitura/escrita direta de licenças e cotas pelo aluno.
-5. Para suspender uma licença, o administrador atualiza `enabled=false`. Para definir vencimento/cota, atualiza `expires_at`/`daily_ai_limit` no Supabase. Não há painel administrativo no app nesta etapa.
+1. **Banco novo:** execute `sql/001_schema.sql` uma vez no SQL Editor. Não execute a migração 003.
+2. **Banco já criado pela versão anterior com Supabase Auth:** execute somente `sql/003_migrate_email_license.sql` uma vez, antes de usar o novo código. Ele copia os e-mails dos antigos proprietários, preserva IDs, registros, validade, cotas e hashes das chaves e invalida sessões antigas. Não apaga usuários do Auth. Se algum proprietário não tiver e-mail válido, a transação é revertida para correção pelo administrador.
+3. Para emitir uma nova licença, troque `aluno@example.com` pelo e-mail real em `002_issue_license_example.sql`. Execute como administrador e entregue a chave retornada de forma privada. Não é preciso criar usuário em Authentication. Não execute o exemplo sem substituir o e-mail.
+4. Copie URL e chave publishable/anon para Secrets. **Não use service_role.** O aluno não tem acesso direto às tabelas.
+5. Para suspender uma licença ou mudar cota/validade, o administrador altera `enabled`, `daily_ai_limit` ou `expires_at`. Não há painel administrativo nesta etapa.
+
+Não basta trocar apenas app.py: o novo services/database.py e o SQL correspondente precisam acompanhar o login sem senha. Reinicie o Streamlit após atualizar para encerrar objetos de sessão da versão antiga.
 
 Exemplo de ação administrativa, com UUID real:
 
@@ -96,7 +101,7 @@ Gerações são síncronas, sem repetição automática. Documentos acima do con
 
 ## Fluxos implementados
 
-1. **Conta/licença:** login e-mail/senha/chave, RPC atômico, renovação e saída. Usuários e licenças são provisionados pelo administrador.
+1. **Conta/licença:** login e-mail/chave, sem senha ou Supabase Auth; RPC atômico, renovação e saída. Licenças são vinculadas ao e-mail pelo administrador.
 2. **Edital:** upload textual de até 20 MB/600 páginas/900 mil caracteres, filtro opcional de cargo, extração Gemini e persistência estruturada. Sem OCR; páginas sem texto interrompem análise.
 3. **Guia:** PDF pesquisável com cartões, cronograma, fases e matérias. Paginação automática; não força duas páginas nem omite disciplinas para caber.
 4. **Plano:** minutos por dia da semana, data de prova opcional, distribuição de blocos de até 50 minutos, adaptação ao histórico de exercícios e horizonte de até 90 dias. Não cria sessões com disponibilidade zero.
@@ -120,15 +125,15 @@ python -m pip install -r requirements-dev.txt
 python -m unittest discover -s tests -v
 ```
 
-Foram executados 15 testes locais com sucesso: regras, contratos, seleção/snapshot, PDF, notas, autenticação simulada, renovação/paginação e navegação com repositório simulado. O SQL recebe verificação sintática, mas não foi executado em um projeto Supabase real. A qualidade da IA e o acesso externo não foram testados com credenciais reais.
+Os 17 testes locais da versão sem senha passaram: regras, contratos, seleção/snapshot, PDF, notas, autenticação simulada, renovação/paginação e navegação com repositório simulado. O SQL recebe verificação sintática, mas não foi executado em um projeto Supabase real. A qualidade da IA e o acesso externo não foram testados com credenciais reais.
 
-Antes do piloto, execute testes de duas contas isoladas, duas autenticações simultâneas, expiração/revogação, refresh JWT, falha de rede, cota concorrente e recuperação de simulados. Confira editais reais com vários cargos, apostilas, gabaritos e manuscritos. Corrija eventuais incompatibilidades do fornecedor/modelo antes de disponibilizar para alunos.
+Antes do piloto, execute testes de dois alunos isolados, dois logins simultâneos, token antigo após nova sessão, expiração/revogação, falha de rede, cota concorrente e recuperação de simulados. Confira editais reais com vários cargos, apostilas, gabaritos e manuscritos. Corrija eventuais incompatibilidades do fornecedor/modelo antes de disponibilizar para alunos.
 
 Limitações adicionais: sem checkout, e-mail de recuperação completo, painel admin, exclusão/exportação integral da conta, backup/restauração configurados, versões de retificações, OCR, prova certo/errado, penalidade por erro, pesos oficiais na pontuação ou revisão pedagógica humana. Dados JSON guardados pelo próprio aluno podem ser alterados por ele: este não é um ambiente de avaliação certificada. Novas questões são geradas a pedido; banco autônomo em worker/filas permanece etapa futura. Grandes simulados podem ultrapassar memória/limite JSON e precisam de paginação e tabelas normalizadas. O cronômetro é apoio de treino, não fiscalização de prova.
 
 ## Referências oficiais
 
-- https://supabase.com/docs/reference/python/auth-signinwithpassword
+- https://supabase.com/docs/reference/python/rpc
 - https://supabase.com/docs/guides/database/postgres/row-level-security
 - https://ai.google.dev/gemini-api/docs/libraries
 - https://ai.google.dev/gemini-api/docs/structured-output

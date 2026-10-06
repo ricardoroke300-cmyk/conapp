@@ -87,21 +87,33 @@ class CoreTests(unittest.TestCase):
         mock.models.generate_content.return_value=SimpleNamespace(candidates=[SimpleNamespace(finish_reason='STOP')],text=json.dumps(question()))
         with patch('services.ai.genai.Client',return_value=mock):self.assertEqual(ai.run(Question,'instruction',{})['answer'],0)
 
-    def test_repo_login_failure_signs_out(self):
-        mock=MagicMock();mock.auth.sign_in_with_password.return_value=SimpleNamespace(user=SimpleNamespace(id='u'),session=object())
-        mock.rpc.return_value.execute.side_effect=RuntimeError('session_in_use')
+    def test_repo_email_license_success_without_auth(self):
+        mock=MagicMock();mock.rpc.return_value.execute.return_value=SimpleNamespace(data={'token':'a'*64,'user_id':'u'})
+        with patch('services.database.create_client',return_value=mock):
+            repo=Repository('url','key');repo.login(' ALUNO@EXAMPLE.COM ','b'*64)
+        self.assertEqual(repo.email,'aluno@example.com');self.assertEqual(repo.user_id,'u')
+        mock.rpc.assert_called_once_with('license_login',{'p_email':'aluno@example.com','p_key':'b'*64})
+        self.assertEqual(mock.auth.mock_calls,[])
+
+    def test_repo_login_failure_and_validation(self):
+        mock=MagicMock();mock.rpc.return_value.execute.side_effect=RuntimeError('session_in_use')
         with patch('services.database.create_client',return_value=mock):
             repo=Repository('url','key')
-            with self.assertRaises(AccessError):repo.login('email','password','license')
-        self.assertIsNone(repo.user_id);mock.auth.sign_out.assert_called_once()
+            with self.assertRaises(AccessError):repo.login('email@example.com','b'*64)
+            with self.assertRaises(AccessError):repo.login('email','key')
+        self.assertIsNone(repo.user_id);self.assertIsNone(repo._token)
+        self.assertEqual(mock.auth.mock_calls,[])
 
-    def test_repo_refresh_and_pagination(self):
-        repo=Repository.__new__(Repository);repo.client=MagicMock();repo.user_id='u'
-        repo.client.auth.get_session.return_value=SimpleNamespace(expires_at=0)
-        repo.check();repo.client.auth.refresh_session.assert_called_once()
-        query=repo.client.table.return_value.select.return_value.eq.return_value.order.return_value
-        query.range.return_value.execute.side_effect=[SimpleNamespace(data=[{}]*500),SimpleNamespace(data=[{}]*2)]
+    def test_repo_token_pagination_logout(self):
+        repo=Repository.__new__(Repository);repo.client=MagicMock();repo.user_id='u';repo.email='a@example.com';repo._token='a'*64
+        repo.client.rpc.return_value.execute.side_effect=[SimpleNamespace(data=True),SimpleNamespace(data=[{}]*500),SimpleNamespace(data=[{}]*2)]
         self.assertEqual(len(repo.list('question')),502)
+        calls=repo.client.rpc.call_args_list
+        self.assertEqual(calls[1].args[1]['p_token'],'a'*64)
+        self.assertEqual(calls[2].args[1]['p_offset'],500)
+        repo.client.rpc.return_value.execute.side_effect=None
+        repo.logout();self.assertIsNone(repo._token)
+        self.assertEqual(repo.client.auth.mock_calls,[])
 
     def test_sql_syntax(self):
         try:from pglast import parse_sql

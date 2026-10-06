@@ -1,39 +1,30 @@
--- Banco NOVO: execute este arquivo uma vez. Sem Supabase Auth.
+-- BANCO ANTIGO já criado pela versão com Supabase Auth: execute somente este arquivo.
+-- Mantém IDs, registros, hash das licenças, validade e cotas. Invalida sessões antigas.
 begin;
-create schema if not exists extensions;
-create extension if not exists pgcrypto with schema extensions;
-create table public.licenses (
- id uuid primary key default gen_random_uuid(),
- key_hash text unique not null,
- user_id uuid unique not null default gen_random_uuid(),
- email text unique not null check(email=lower(btrim(email)) and position('@' in email)>1),
- enabled boolean not null default true,
- expires_at timestamptz,
- active_session text,
- session_hash text unique,
- session_expires_at timestamptz,
- lease_until timestamptz,
- daily_ai_limit integer not null default 30 check(daily_ai_limit between 0 and 10000),
- created_at timestamptz not null default now()
-);
-create table public.ai_usage (
- user_id uuid not null references public.licenses(user_id) on delete cascade,
- day date not null,calls integer not null default 0,
- primary key(user_id,day)
-);
-create table public.records (
- id uuid primary key default gen_random_uuid(),
- user_id uuid not null references public.licenses(user_id) on delete cascade,
- kind text not null check(kind in ('edital','plan','booklet','board','question','simulation','attempt','essay')),
- payload jsonb not null check(jsonb_typeof(payload)='object' and octet_length(payload::text)<=4000000),
- created_at timestamptz not null default now()
-);
-create index records_owner_kind on public.records(user_id,kind,created_at,id);
-alter table public.licenses enable row level security;
-alter table public.ai_usage enable row level security;
-alter table public.records enable row level security;
--- Nenhum cliente anônimo/autenticado recebe acesso direto às tabelas.
+alter table public.licenses add column email text;
+alter table public.licenses add column session_hash text;
+alter table public.licenses add column session_expires_at timestamptz;
+-- Único uso da tabela antiga de Auth: copiar e-mail na migração, não no login.
+update public.licenses l set email=lower(btrim(u.email)) from auth.users u where u.id=l.user_id;
+-- Se um proprietário não tiver e-mail válido, a migração inteira é revertida.
+alter table public.licenses alter column email set not null;
+alter table public.licenses add constraint licenses_email_key unique(email);
+alter table public.licenses add constraint licenses_email_check check(email=lower(btrim(email)) and position('@' in email)>1);
+alter table public.licenses add constraint licenses_session_hash_key unique(session_hash);
+alter table public.licenses drop constraint licenses_user_id_fkey;
+alter table public.licenses alter column user_id set default gen_random_uuid();
+alter table public.records drop constraint records_user_id_fkey;
+alter table public.ai_usage drop constraint ai_usage_user_id_fkey;
+alter table public.records add constraint records_user_id_fkey foreign key(user_id) references public.licenses(user_id) on delete cascade;
+alter table public.ai_usage add constraint ai_usage_user_id_fkey foreign key(user_id) references public.licenses(user_id) on delete cascade;
+update public.licenses set active_session=null,lease_until=null;
 revoke all on public.licenses,public.ai_usage,public.records from anon,authenticated;
+drop policy if exists own_licensed_records on public.records;
+drop function if exists public.acquire_license(text);
+drop function if exists public.heartbeat_license();
+drop function if exists public.release_license();
+drop function if exists public.reserve_ai_call();
+drop function if exists public.has_active_license();
 
 create schema if not exists private;
 revoke all on schema private from public,anon,authenticated;

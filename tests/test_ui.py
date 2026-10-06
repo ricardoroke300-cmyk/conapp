@@ -8,6 +8,7 @@ from test_core import guide,question
 
 class FakeRepo:
     user_id='test-user'
+    email='aluno@example.com'
     def __init__(self):
         self.rows=[{'id':'edict','kind':'edital','created_at':'2026-10-06T12:00:00Z','payload':{'name':'teste.pdf','cargo':'','data':{'guia':guide(),'exam_date':'','essay_criteria':[]}}},{'id':'q1','kind':'question','created_at':'2026-10-06T12:00:00Z','payload':{'edict_id':'edict','question':question()}}]
     def check(self):pass
@@ -28,6 +29,13 @@ class UI(unittest.TestCase):
         app=AppTest.from_file(str(ROOT/'app.py')).run()
         self.assertEqual(len(app.exception),0)
         self.assertTrue(any('Configure' in x.value for x in app.info))
+
+    def test_login_has_only_email_license(self):
+        app=AppTest.from_file(str(ROOT/'app.py'))
+        app.secrets={'SUPABASE_URL':'https://example.supabase.co','SUPABASE_KEY':'fake'}
+        app.run()
+        self.assertEqual([x.label for x in app.text_input],['E-mail','Chave de licença'])
+        self.assertEqual(len(app.exception),0)
 
     def test_all_ten_modules_render(self):
         app=self.app()
