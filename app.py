@@ -1,3 +1,8 @@
+import sys, os
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from services.database import Repository, AccessError
+
 """Ponto de entrada: configuração → autenticação → contexto → módulo."""
 import streamlit as st
 from services.database import Repository,AccessError
